@@ -815,7 +815,9 @@ message DebugOptions {
 
   string xla_gpu_kernel_cache_file = 306;
 
-  // Next id: 308
+  bool xla_syntax_sugar_async_ops = 308;
+
+  // Next id: 309
 
   // Extra options to pass to the compilation backend (e.g. LLVM); specific
   // interpretation of these values is left to the backend.

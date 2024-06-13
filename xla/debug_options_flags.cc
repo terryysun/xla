@@ -1747,6 +1747,11 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "write the compilation cache of the first compiled HLO module into it."
       "Once the file exists, further compilations will read it to reuse "
       "the kernels, but not write it. This behavior may change later."));
+  flag_list->push_back(
+      tsl::Flag("xla_syntax_sugar_async_ops",
+                bool_setter_for(&DebugOptions::set_xla_syntax_sugar_async_ops),
+                debug_options->xla_syntax_sugar_async_ops(),
+                "Enable syntax sugar for async ops in HLO dumps."));
 }  // NOLINT(readability/fn_size)
 
 // Allocates flag_values and flag_objects; this function must not be called more
