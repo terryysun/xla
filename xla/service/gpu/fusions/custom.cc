@@ -865,7 +865,7 @@ absl::StatusOr<FusionEmissionResult> EmitCollective(
     // TODO: add special handling for degenerate case - where no communication
     // is needed. Just copy.
     auto rs_start_thunk = std::make_unique<NcclReduceScatterStartThunk>(
-        thunk_info, NcclApi::Default(), rs, buffers);
+        thunk_info, NcclApi::Default(), rs, buffers, false);
     auto rs_done = std::make_unique<NcclCollectiveDoneThunk>(
         /*kind=*/Thunk::kNcclReduceScatterDone,
         /*thunk_info=*/Thunk::ThunkInfo::WithProfileAnnotation(rs),
