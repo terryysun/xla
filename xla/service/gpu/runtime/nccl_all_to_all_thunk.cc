@@ -102,6 +102,16 @@ absl::Status NcclAllToAllStartThunk::Initialize(
   return absl::OkStatus();
 }
 
+absl::Status NcclAllToAllStartThunk::Cleanup(
+    const CleanupParams& params) {
+  if (p2p_memcpy_enabled_ && receive_pointer_map_) {
+    if (!params.executor->HostMemoryUnregister(receive_pointer_map_)) {
+      VLOG(5) << "Unregistering host receive pointer for memcpy failed.";
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::Status NcclAllToAllStartThunk::RunNcclCollective(
     const ExecuteParams& params, se::Stream& stream,
     NcclCommHandleWrapper comm_wrapper) {
@@ -113,15 +123,22 @@ absl::Status NcclAllToAllStartThunk::RunNcclCollective(
                       GetCurrentId(params.collective_params, config_));
   TF_ASSIGN_OR_RETURN(int32_t num_participants,
                       nccl_api()->CommCount(comm_wrapper.comm_handle));
-  for (int64_t id = 0; id < num_participants; ++id) {
-    TF_RETURN_IF_ERROR(recv_ptr_map_.InitializeId(id, current_id));
-    TF_RETURN_IF_ERROR(recv_ptr_map_.InitializeId(current_id, id));
+  if (!receive_pointer_map_) {
+    if (!params.stream->parent()->HostMemoryRegister(
+            receive_pointer_map_,
+            sizeof(void*) * num_participants * num_participants)) {
+        VLOG(5) << "Registering host receive pointer for memcpy failed.";
+      }
   }
 
-  bool use_memcpy = is_local() && p2p_memcpy_enabled_;
+  if (is_local() && p2p_memcpy_enabled_) {
+    return xla::gpu::RunMemCpyAllToAll(
+        nccl_api(), config_.has_split_dimension, device_buffers, stream,
+        comm_wrapper.comm_handle, current_id, receive_pointer_map_);
+  }
   return xla::gpu::RunAllToAll(nccl_api(), config_.has_split_dimension,
-                               device_buffers, stream, comm_wrapper.comm_handle,
-                               current_id, use_memcpy, recv_ptr_map_);
+                               device_buffers, stream,
+                               comm_wrapper.comm_handle);
 }
 
 AsyncStreamKind NcclAllToAllStartThunk::GetAsyncStreamKind() const {
@@ -144,9 +161,7 @@ bool NcclAllToAllStartThunk::is_local() const {
 
 absl::Status RunAllToAll(NcclApi* nccl_api, bool has_split_dimension,
                          std::vector<DeviceBufferPair>& buffers,
-                         se::Stream& stream, NcclApi::NcclCommHandle comm,
-                         int64_t current_id, bool use_memcpy,
-                         NcclAllToAllStartThunk::RecvPtrMap& recv_ptr_map) {
+                         se::Stream& stream, NcclApi::NcclCommHandle comm) {
   int device_ordinal = stream.parent()->device_ordinal();
   VLOG(3) << "Performing all-to-all from device ordinal: " << device_ordinal;
   TF_RETURN_IF_ERROR(
@@ -154,11 +169,7 @@ absl::Status RunAllToAll(NcclApi* nccl_api, bool has_split_dimension,
 
   TF_ASSIGN_OR_RETURN(int32_t num_participants, nccl_api->CommCount(comm));
 
-  if (use_memcpy) {
-    TF_RETURN_IF_ERROR(stream.BlockHostUntilDone());
-  } else {
-    TF_RETURN_IF_ERROR(nccl_api->GroupStart());
-  }
+  TF_RETURN_IF_ERROR(nccl_api->GroupStart());
 
   // AllToAll can operate in two modes. Either it specifies a split dimension,
   // in which case inputs are split and outputs concatenated in that dimension
@@ -180,80 +191,105 @@ absl::Status RunAllToAll(NcclApi* nccl_api, bool has_split_dimension,
             NcclApi::Slice(buffer.destination_buffer, buffer.element_type,
                            peer * chunk_elements, chunk_elements);
 
-        if (use_memcpy) {
-          TF_RETURN_IF_ERROR(
-              recv_ptr_map.PutRecvPtr(peer, current_id, recv_slice.opaque()));
-          TF_ASSIGN_OR_RETURN(auto recv_ptr,
-                              recv_ptr_map.GetRecvPtr(current_id, peer));
-          if (recv_ptr.IsUnavailable()) {
-            // TODO make BlockUntilReady support AsyncValueRef directly.
-            BlockUntilReady(recv_ptr.GetAsyncValue());
-          }
-          VLOG(3) << "Using memcpy, received target pointer: " << recv_ptr.get()
-                  << " current_id " << current_id << " target_id: " << peer;
-          VLOG(3) << current_id << " initiating memcpy to " << peer;
-          se::DeviceMemoryBase dst_addr = se::DeviceMemoryBase(recv_ptr.get());
-          TF_RETURN_IF_ERROR(
-              stream.MemcpyD2D(&dst_addr, send_slice, send_slice.size()));
-        } else {
-          TF_RETURN_IF_ERROR(nccl_api->Send(send_slice, buffer.element_type,
-                                            chunk_elements, peer, comm,
-                                            &stream));
+        TF_RETURN_IF_ERROR(nccl_api->Send(send_slice, buffer.element_type,
+                                          chunk_elements, peer, comm, &stream));
 
-          TF_RETURN_IF_ERROR(nccl_api->Recv(recv_slice, buffer.element_type,
-                                            chunk_elements, peer, comm,
-                                            &stream));
-        }
+        TF_RETURN_IF_ERROR(nccl_api->Recv(recv_slice, buffer.element_type,
+                                          chunk_elements, peer, comm, &stream));
       }
     }
   } else {
     TF_RET_CHECK(buffers.size() == num_participants)
         << "Number of inputs didn't match the number of participants.";
 
-    for (size_t peer = 0; peer < buffers.size(); ++peer) {
-      DeviceBufferPair& buffer = buffers[peer];
+    for (size_t i = 0; i < buffers.size(); ++i) {
+      DeviceBufferPair& buffer = buffers[i];
 
-      if (use_memcpy) {
-        TF_RETURN_IF_ERROR(recv_ptr_map.PutRecvPtr(
-            peer, current_id, buffers[current_id].destination_buffer.opaque()));
-        TF_ASSIGN_OR_RETURN(auto recv_ptr,
-                            recv_ptr_map.GetRecvPtr(current_id, peer));
-        if (recv_ptr.IsUnavailable()) {
-          // TODO make BlockUntilReady support AsyncValueRef directly.
-          BlockUntilReady(recv_ptr.GetAsyncValue());
-        }
-        VLOG(3) << "Using double buffer memcpy, participanting pointers: "
-                << buffer.destination_buffer.opaque() << ", " << recv_ptr.get();
-        VLOG(3) << current_id << " initiating double buffer memcpy to " << peer;
+      TF_RETURN_IF_ERROR(
+          nccl_api->Send(buffer.source_buffer, buffer.element_type,
+                         buffer.element_count, i, comm, &stream));
 
-        // double buffer, exchange data with peer
-        se::DeviceMemoryBase dst_addr = se::DeviceMemoryBase(recv_ptr.get());
-        se::DeviceMemoryBase cur_addr =
-            se::DeviceMemoryBase(buffer.destination_buffer);
-        // TODO parallelize below copies on to two streams
-        TF_RETURN_IF_ERROR(stream.MemcpyD2D(&dst_addr, buffer.source_buffer,
-                                            buffer.source_buffer.size()));
-        TF_RETURN_IF_ERROR(
-            stream.MemcpyD2D(&cur_addr, buffers[peer].source_buffer,
-                             buffers[peer].source_buffer.size()));
-      } else {
-        TF_RETURN_IF_ERROR(
-            nccl_api->Send(buffer.source_buffer, buffer.element_type,
-                           buffer.element_count, peer, comm, &stream));
-
-        TF_RETURN_IF_ERROR(
-            nccl_api->Recv(buffer.destination_buffer, buffer.element_type,
-                           buffer.element_count, peer, comm, &stream));
-      }
+      TF_RETURN_IF_ERROR(
+          nccl_api->Recv(buffer.destination_buffer, buffer.element_type,
+                         buffer.element_count, i, comm, &stream));
     }
   }
 
-  if (use_memcpy) {
-    TF_RETURN_IF_ERROR(stream.BlockHostUntilDone());
+  return nccl_api->GroupEnd();
+}
+
+absl::Status RunMemCpyAllToAll(NcclApi* nccl_api, bool has_split_dimension,
+                               std::vector<DeviceBufferPair>& buffers,
+                               se::Stream& stream, NcclApi::NcclCommHandle comm,
+                               int64_t current_id, void** recv_ptr_map) {
+  int device_ordinal = stream.parent()->device_ordinal();
+  VLOG(3) << "Performing mem-copy-all-to-all from device ordinal: "
+          << device_ordinal;
+  TF_RETURN_IF_ERROR(
+      MaybeRegisterBuffers(nccl_api, device_ordinal, buffers, comm));
+
+  TF_ASSIGN_OR_RETURN(int32_t num_participants, nccl_api->CommCount(comm));
+
+  TF_RETURN_IF_ERROR(nccl_api->GroupStart());
+
+  // AllToAll can operate in two modes. Either it specifies a split dimension,
+  // in which case inputs are split and outputs concatenated in that dimension
+  // (here, we only support dimension 0), or it takes a list of inputs
+  // and produces a tuple of outputs.
+  if (has_split_dimension) {
+    for (DeviceBufferPair& buffer : buffers) {
+      TF_RET_CHECK(buffer.element_count % num_participants == 0)
+          << "Buffer was not an exact multiple of the number of participants.";
+
+      size_t chunk_elements = buffer.element_count / num_participants;
+
+      for (int peer = 0; peer < num_participants; ++peer) {
+        se::DeviceMemoryBase recv_slice =
+            NcclApi::Slice(buffer.destination_buffer, buffer.element_type,
+                           peer * chunk_elements, chunk_elements);
+        recv_ptr_map[current_id * num_participants + peer] =
+            recv_slice.opaque();
+      }
+      nccl_api->AllGatherPtrs(&recv_ptr_map[current_id * num_participants],
+                              &recv_ptr_map, num_participants, comm, &stream);
+      VLOG(3) << "Using memcpy, received target pointer map: " << recv_ptr_map
+              << " current_id " << current_id;
+
+      for (int peer = 0; peer < num_participants; ++peer) {
+        se::DeviceMemoryBase send_slice =
+            NcclApi::Slice(buffer.source_buffer, buffer.element_type,
+                           peer * chunk_elements, chunk_elements);
+        se::DeviceMemoryBase dst_addr = se::DeviceMemoryBase(
+            recv_ptr_map[peer * num_participants + current_id]);
+        TF_RETURN_IF_ERROR(
+            stream.MemcpyD2D(&dst_addr, send_slice, send_slice.size()));
+      }
+    }
   } else {
-    return nccl_api->GroupEnd();
+    TF_RET_CHECK(buffers.size() == num_participants)
+        << "Number of inputs didn't match the number of participants.";
+
+    for (int peer = 0; peer < num_participants; ++peer) {
+      recv_ptr_map[current_id * num_participants + peer] =
+          buffers[peer].destination_buffer.opaque();
+    }
+
+    nccl_api->AllGatherPtrs(&recv_ptr_map[current_id * num_participants],
+                            &recv_ptr_map, num_participants, comm, &stream);
+    VLOG(3) << "Using memcpy, received target pointer map: " << recv_ptr_map
+            << " current_id " << current_id;
+
+    for (size_t peer = 0; peer < num_participants; ++peer) {
+      // double buffer, exchange data with peer
+      se::DeviceMemoryBase dst_addr = se::DeviceMemoryBase(
+          recv_ptr_map[peer * num_participants + current_id]);
+      TF_RETURN_IF_ERROR(stream.MemcpyD2D(&dst_addr,
+                                          buffers[peer].source_buffer,
+                                          buffers[peer].source_buffer.size()));
+    }
   }
-  return absl::OkStatus();
+
+  return nccl_api->GroupEnd();
 }
 
 }  // namespace gpu

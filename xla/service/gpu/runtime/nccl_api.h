@@ -240,6 +240,10 @@ class NcclApi {
                                  se::DeviceMemoryBase recv_buffer,
                                  PrimitiveType dtype, size_t count,
                                  NcclCommHandle comm, se::Stream* stream) = 0;
+  // Gather pointers from all GPUs
+  virtual absl::Status AllGatherPtrs(void* send_ptr, void* recv_ptr,
+                                     size_t count, NcclCommHandle comm,
+                                     se::Stream* stream) = 0;
 
   // Send data from `send_buff` to rank `peer`.
   //

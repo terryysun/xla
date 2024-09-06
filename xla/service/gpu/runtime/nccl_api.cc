@@ -326,6 +326,8 @@ class DefaultNcclApi final : public NcclApi {
                          se::DeviceMemoryBase recv_buffer, PrimitiveType dtype,
                          size_t count, NcclCommHandle comm,
                          se::Stream* stream) final;
+  absl::Status AllGatherPtrs(void* send_ptr, void* recv_ptr, size_t count,
+                             NcclCommHandle comm, se::Stream* stream) final;
 
   absl::Status Send(se::DeviceMemoryBase send_buffer, PrimitiveType dtype,
                     size_t count, int32_t peer, NcclCommHandle comm,
@@ -589,6 +591,19 @@ absl::Status DefaultNcclApi::AllGather(se::DeviceMemoryBase send_buffer,
   return XLA_NCCL_STATUS(ncclAllGather(
       send_buffer.opaque(), recv_buffer.opaque(), ToNcclCount(dtype, count),
       nccl_dtype, Cast(comm), se::gpu::AsGpuStreamValue(stream)));
+}
+
+absl::Status DefaultNcclApi::AllGatherPtrs(void* send_ptr, void* recv_ptr,
+                                           size_t count, NcclCommHandle comm,
+                                           se::Stream* stream) {
+  VLOG(3) << absl::StreamFormat(
+      "Launch NCCL AllGatherPtrs operation on device #%d; send_pointer=%p; "
+      "recv_pointer=%p; count=%d; comm=%p; stream=%p",
+      stream->parent()->device_ordinal(), send_ptr, recv_ptr, count, comm,
+      stream);
+  return XLA_NCCL_STATUS(ncclAllGather(send_ptr, recv_ptr, 1, ncclUint64,
+                                       Cast(comm),
+                                       se::gpu::AsGpuStreamValue(stream)));
 }
 
 absl::Status DefaultNcclApi::Send(se::DeviceMemoryBase send_buffer,
