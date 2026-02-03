@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/command.h"
 #include "xla/backends/gpu/runtime/command_buffer_cmd.h"
 #include "xla/backends/gpu/runtime/command_buffer_thunk.h"
+#include "xla/backends/gpu/runtime/command_executor.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/runtime/buffer_use.h"
 #include "xla/service/buffer_assignment.h"
@@ -164,10 +165,10 @@ void LaunchCommandBufferThunk(stream_executor::StreamExecutor* executor,
                               LaunchDimensions(1, kLength),
                               /*shmem_bytes=*/0);
   TF_ASSERT_OK_AND_ASSIGN(
-      CommandBufferCmdExecutor cmd_buffer_executor,
-      CommandBufferCmdExecutor::Create(
+      CommandExecutor cmd_buffer_executor,
+      CommandExecutor::Create(
           std::move(commands),
-          CommandBufferCmdExecutor::SynchronizationMode::kConcurrent));
+          CommandExecutor::SynchronizationMode::kConcurrent));
 
   // Construct a thunk with command sequence.
   CommandBufferThunk thunk(std::move(cmd_buffer_executor), Thunk::ThunkInfo());

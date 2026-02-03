@@ -203,12 +203,11 @@ absl::StatusOr<bool> IsDotSupportedByYnn(
   TF_ASSIGN_OR_RETURN(DotCanonicalDims dot_canonical_dims,
                       GetDotCanonicalDims(dot_dimensions, dot_shape));
 
-  if (dot_canonical_dims.m == 1 && dot_canonical_dims.n == 1 &&
-      dot_shape.batch_size > 1) {
-    // TODO(b/430079105): YNNPACK does not handle batch dimensions that are not
-    // matrix dimensions. We could handle this case by fully implementing dot
-    // (b/430079105), but we also could just insert dummy dimensions of size 1
-    // for the matrix dimensions, so the batch dimensions get handled correctly.
+  if (dot_canonical_dims.m == 1 || dot_canonical_dims.n == 1) {
+    // TODO(b/430079105): YNNPACK does not handle vectors in dots. We could
+    // insert dummy extent 1 dimensions to handle this case. We don't expect to
+    // see this because XLA handles these with its own codegen, but if dots get
+    // pulled into fusions, we need to reject them (b/469236467).
     return false;
   }
 
@@ -243,6 +242,11 @@ bool IsReduceOpSupportedByYnn(const HloInstruction* hlo) {
   if (!YnnType(hlo->shape().element_type()).ok()) {
     return false;
   }
+  if (!IsLayoutSupportedByYnn(hlo->shape()) ||
+      !IsLayoutSupportedByYnn(hlo->operand(0)->shape())) {
+    return false;
+  }
+
   const HloReduceInstruction* reduce = Cast<HloReduceInstruction>(hlo);
   CHECK_NE(reduce, nullptr);
   // TODO(ashaposhnikov): we can support this edge case,
@@ -312,9 +316,10 @@ bool IsConvolutionOpSupportedByYnn(const HloInstruction* instr) {
   }
 
   // Stores tuple of allowed (input, output) dtypes.
+  // TODO(b/466474339): Enable other data types.
   static const absl::NoDestructor<absl::flat_hash_set<
       std::tuple<PrimitiveType, PrimitiveType, PrimitiveType>>>
-      kAllowedTypes({{F32, F32, F32}, {BF16, BF16, F32}, {S8, S8, S32}});
+      kAllowedTypes({/*{F32, F32, F32}, {BF16, BF16, F32},*/ {S8, S8, S32}});
 
   const Shape& lhs_shape = conv->operand(0)->shape();
   const Shape& rhs_shape = conv->operand(1)->shape();
@@ -354,9 +359,26 @@ bool IsConvolutionOpSupportedByYnn(const HloInstruction* instr) {
     return false;
   }
 
-  // Skip if output is larger than input.
+  if (std::max({
+          lhs_shape.dimensions(conv_dimensions.input_feature_dimension()),
+          out_shape.dimensions(conv_dimensions.output_feature_dimension()),
+      }) <= 16) {
+    // If this  convolution is small, our overhead is probably too significant.
+    // TODO(b/458529782, b/473570788): This is here as a workaround for an
+    // unrelated bug.
+    return false;
+  }
+
+  // Skip if output or filter is larger than input.
+  // TODO(b/476207717): this should work fine in theory, but currently this
+  // fails at one of the shape checks fails as statically false. I think the
+  // issue is that an inferred input size is larger than what was provided.
   for (int i = 0; i < conv_dimensions.input_spatial_dimensions_size(); ++i) {
     if (out_shape.dimensions(conv_dimensions.output_spatial_dimensions(i)) >
+        lhs_shape.dimensions(conv_dimensions.input_spatial_dimensions(i))) {
+      return false;
+    }
+    if (rhs_shape.dimensions(conv_dimensions.kernel_spatial_dimensions(i)) >
         lhs_shape.dimensions(conv_dimensions.input_spatial_dimensions(i))) {
       return false;
     }

@@ -3051,6 +3051,7 @@ Future<> PjRtCApiBuffer::ToLiteral(MutableLiteralBase* literal) {
   args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
   args.extension_start = nullptr;
   args.src = buffer_.get();
+  args.event = nullptr;
 
   const xla::Shape& shape = literal->shape();
 
@@ -3062,6 +3063,15 @@ Future<> PjRtCApiBuffer::ToLiteral(MutableLiteralBase* literal) {
 
   args.dst_size = ShapeUtil::ByteSizeOfElements(shape);
   args.dst = literal->untyped_data();
+  std::unique_ptr<char[]> placeholder_dst;
+  if (args.dst == nullptr && args.dst_size == 0) {
+    // `PJRT_Buffer_ToHostBuffer` returns early for `nullptr` dst, which skips
+    // buffer error propagation. Therefore, we set `args.dst` to a non-null
+    // placeholder to force `PJRT_Buffer_ToHostBuffer` to proceed to copy and
+    // propagate errors.
+    placeholder_dst = std::make_unique<char[]>(0);
+    args.dst = placeholder_dst.get();
+  }
   absl::StatusOr<pjrt::BufferMemoryLayoutData> c_layout_data;
   if (literal->shape().has_layout()) {
     c_layout_data =
@@ -3083,7 +3093,7 @@ Future<> PjRtCApiBuffer::ToLiteral(MutableLiteralBase* literal) {
   if (error != nullptr) {
     return Future<>(::pjrt::PjrtErrorToStatus(error.get(), api));
   }
-
+  CHECK(args.event != nullptr);
   return pjrt::ConvertCEventToCppFuture(args.event, api);
 }
 

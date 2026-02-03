@@ -113,9 +113,6 @@ static auto FindRepeatedFieldValue(google::protobuf::RepeatedField<int>* list, T
 }
 
 // Returns a `DebugOptions` setter for repeated enum flag of type `T`.
-// NOLINTBEGIN(readability-function-cognitive-complexity)
-// We disable the cognitive complexity check here because we need to return a
-// lambda function.
 template <typename T>
 static auto SetterForRepeatedEnum(
     absl::string_view flag_name, absl::string_view enum_prefix,
@@ -159,7 +156,6 @@ static auto SetterForRepeatedEnum(
     return true;
   };
 }
-// NOLINTEND(readability-function-cognitive-complexity)
 
 }  // namespace
 
@@ -215,6 +211,10 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
       DebugOptions::XNN_GRAPH_FUSION_MODE_DISABLED);
   opts.add_xla_cpu_experimental_ynn_fusion_type(
       DebugOptions::LIBRARY_FUSION_TYPE_INDIVIDUAL_DOT);
+  opts.add_xla_cpu_experimental_ynn_fusion_type(
+      DebugOptions::LIBRARY_FUSION_TYPE_INDIVIDUAL_CONVOLUTION);
+  opts.add_xla_cpu_experimental_ynn_fusion_type(
+      DebugOptions::LIBRARY_FUSION_TYPE_REDUCE);
   opts.set_xla_cpu_parallel_codegen_split_count(32);
   opts.set_xla_cpu_copy_insertion_use_region_analysis(false);
   opts.set_xla_cpu_enable_concurrency_optimized_scheduler(true);
@@ -248,8 +248,6 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_command_buffer_scheduling_mode(DebugOptions::LHS);
   opts.set_xla_gpu_command_buffer_unroll_loops(false);
   opts.set_xla_cmd_buffer_trace_cache_size(16);
-
-  opts.set_xla_gpu_collectives_use_persistent_cliques(false);
 
   // Despite the name, fast min/max on GPUs does not seem to be any faster, and
   // adds very counter-intuitive "NaN-swallowing" behavior.
@@ -472,6 +470,8 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
       DebugOptions::DETECTION_MODE_NONE);
   opts.set_xla_gpu_experimental_scaled_dot_with_triton(false);
   opts.set_xla_gpu_experimental_use_raft_select_k(false);
+  opts.set_xla_early_exit_with_layouts(false);
+  opts.set_xla_gpu_experimental_all_fusions_with_triton(false);
 
   opts.add_xla_gpu_experimental_autotune_backends(
       DebugOptions::AUTOTUNE_BACKEND_TRITON);
@@ -1708,12 +1708,6 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
                 debug_options->xla_gpu_enable_cublaslt(),
                 "Use cuBLASLt for GEMMs when possible."));
   flag_list->push_back(tsl::Flag(
-      "xla_gpu_collectives_use_persistent_cliques",
-      bool_setter_for(
-          &DebugOptions::set_xla_gpu_collectives_use_persistent_cliques),
-      debug_options->xla_gpu_collectives_use_persistent_cliques(),
-      "Use persistent per-process XLA:GPU collectives cliques"));
-  flag_list->push_back(tsl::Flag(
       "xla_gpu_enable_command_buffer",
       SetterForRepeatedEnum<DebugOptions::CommandBufferCmdType>(
           "xla_gpu_enable_command_buffer",
@@ -2106,6 +2100,13 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "xla_dump_to or stdout. Each fusion is dumped only once, as an optimized "
       "HLO."));
   flag_list->push_back(tsl::Flag(
+      "xla_gpu_dump_autotuned_instructions",
+      bool_setter_for(&DebugOptions::set_xla_gpu_dump_autotuned_instructions),
+      debug_options->xla_gpu_dump_autotuned_instructions(),
+      "Dumps autotuned instructions to the directory specified by "
+      "xla_dump_to or stdout. Each instruction is dumped only once, as an "
+      "optimized HLO."));
+  flag_list->push_back(tsl::Flag(
       "xla_gpu_override_gemm_autotuner",
       string_setter_for(&DebugOptions::set_xla_gpu_override_gemm_autotuner),
       debug_options->xla_gpu_override_gemm_autotuner(),
@@ -2396,6 +2397,12 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "  '+cudnn,-cublas' (adds/removes from defaults)\n"
       "Available: cudnn, triton, cublas, cublaslt."));
   flag_list->push_back(tsl::Flag(
+      "xla_gpu_experimental_all_fusions_with_triton",
+      bool_setter_for(
+          &DebugOptions::set_xla_gpu_experimental_all_fusions_with_triton),
+      debug_options->xla_gpu_experimental_all_fusions_with_triton(),
+      "Experimental: If true, autotune all fusions with block level emitter."));
+  flag_list->push_back(tsl::Flag(
       "xla_gpu_gemm_autotuner_override_file",
       string_setter_for(
           &DebugOptions::set_xla_gpu_gemm_autotuner_override_file),
@@ -2525,11 +2532,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       bool_setter_for(
           &DebugOptions::set_xla_gpu_enable_scatter_determinism_expander),
       debug_options->xla_gpu_enable_scatter_determinism_expander(),
-      "Enable the scatter determinism expander, an optimized pass that "
-      "rewrites scatter operations to ensure deterministic behavior with high "
-      "performance."
+      "Makes scatter ops deterministic and enables the use of the scatter "
+      "determinism expander. This is an optimized pass that rewrites scatter "
+      "operations to ensure deterministic behavior with high performance. If "
+      "the optimization pass does not support a particular scater op, it will "
+      "be made deterministic using a slower implementation. "
       "Note that even when this flag is disabled, scatter operations may still "
-      "be deterministic, although with additional overhead."));
+      "be deterministic, with the slower implemntation. This is the case when "
+      "'xla_gpu_exclude_nondeterministic_ops' is enabled."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_unsupported_enable_all_reduce_decomposer",
       bool_setter_for(
@@ -2834,6 +2844,12 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "'warning', and 'fail'. 'none' is the default. If other than 'none' "
       "value is provided, additional thunks will be added to detect and "
       "warn or fail the execution if Infs are detected."));
+  flag_list->push_back(tsl::Flag(
+      "xla_early_exit_with_layouts",
+      bool_setter_for(&DebugOptions::set_xla_early_exit_with_layouts),
+      debug_options->xla_early_exit_with_layouts(),
+      "If true, exit early from the layout assignment pass after assigning "
+      "layouts to entry computations."));
 }  // NOLINT(readability/fn_size)
 
 // Allocates flag_values and flag_objects; this function must not be called more

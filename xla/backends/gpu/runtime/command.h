@@ -16,13 +16,26 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_RUNTIME_COMMAND_H_
 #define XLA_BACKENDS_GPU_RUNTIME_COMMAND_H_
 
+#include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
+#include <variant>
+#include <vector>
 
+#include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "xla/backends/gpu/runtime/command_state.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/runtime/buffer_use.h"
 #include "xla/runtime/resource_use.h"
+#include "xla/service/buffer_assignment.h"
 #include "xla/stream_executor/command_buffer.h"
+#include "xla/stream_executor/platform.h"
 
 namespace xla::gpu {
 
@@ -129,8 +142,8 @@ class Command {
     CommandStateManager& state;
 
     // Buffer allocations that changed since the last call to `Record`. Buffer
-    // allocation indices are sorted. CommandBufferCmdExecutor and individual
-    // commands rely on this information to skip unnecessary updates.
+    // allocation indices are sorted. CommandExecutor and individual commands
+    // rely on this information to skip unnecessary updates.
     std::optional<std::vector<BufferAllocation::Index>> updated_allocs;
 
     // A flag indicating whether we record comands at command buffer thunk
@@ -173,8 +186,7 @@ class Command {
   // Initialize a command for recording on a given executor. We split it into a
   // separate function to allow expensive initialization (e.g. device kernel
   // loading) to happen before a command buffer thunk execution.
-  virtual absl::Status Initialize(const Thunk::InitializeParams& params,
-                                  CommandStateManager& state) {
+  virtual absl::Status Initialize(const Thunk::InitializeParams& params) {
     return absl::OkStatus();
   }
 
@@ -216,7 +228,7 @@ class Command {
 
   std::shared_ptr<Resource> token() const { return token_; }
 
-  void add_resouce_use(ResourceUse resource_use) {
+  void add_resource_use(ResourceUse resource_use) {
     resources_.push_back(resource_use);
   }
   ResourceUseVector resources() const { return resources_; }

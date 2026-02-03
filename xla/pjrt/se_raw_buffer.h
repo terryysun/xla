@@ -91,6 +91,22 @@ class PjRtStreamExecutorDeviceEventPromise : public PjRtDeviceEventPromise {
   tsl::AsyncValueRef<BufferSequencingEvent> event_;
 };
 
+class PjRtStreamExecutorDeviceEventSet : public PjRtDeviceEventSet {
+ public:
+  explicit PjRtStreamExecutorDeviceEventSet(size_t reservation) {
+    events_.reserve(reservation);
+  }
+
+  void AddEvent(BufferSequencingEvent* event) { events_.insert(event); }
+
+  const absl::flat_hash_set<BufferSequencingEvent*>& events() const {
+    return events_;
+  }
+
+ private:
+  absl::flat_hash_set<BufferSequencingEvent*> events_;
+};
+
 class PjRtStreamExecutorRawBuffer : public CommonPjRtRawBuffer {
  public:
   PjRtStreamExecutorRawBuffer(
@@ -139,20 +155,39 @@ class PjRtStreamExecutorRawBuffer : public CommonPjRtRawBuffer {
   void ReadDynamicShape(tsl::AsyncValueRef<xla::Shape> output_shape,
                         xla::Shape shape) override;
 
+  absl::StatusOr<tsl::RCReference<CommonPjRtRawBuffer>>
+  RemoveDynamicShapeMetadataIfPresent(const xla::Shape& logical_shape) override;
+
   void CopyToLiteralAsync(
       Promise<> promise,
       tsl::RCReference<PjRtDeviceEventPromise> device_promise,
       MutableLiteralBase* literal, xla::Shape shape) override;
+
   void CopyTo(tsl::RCReference<CommonPjRtRawBuffer> dst_raw_buffer,
               tsl::RCReference<PjRtDeviceEventPromise> definition_event_promise,
               tsl::RCReference<PjRtDeviceEventPromise> src_usage_event_promise,
               ::tsl::AsyncValueRef<bool> allocation_event) override;
+
+  void ScheduleCopyTo(
+      AsyncWorkRunner* async_work_runner,
+      std::vector<tsl::RCReference<tsl::AsyncValue>> transfer_dependency_avs,
+      tsl::RCReference<CommonPjRtRawBuffer> dst_raw_buffer,
+      tsl::RCReference<PjRtDeviceEventPromise> definition_event_promise,
+      tsl::RCReference<PjRtDeviceEventPromise> src_usage_event_promise,
+      ::tsl::AsyncValueRef<bool> allocation_event) override;
 
  private:
   PjRtStreamExecutorClient* client_;
   PjRtMemorySpace* memory_space_;
   LocalDeviceState* local_device_;
   tsl::AsyncValueRef<RawSEDeviceMemory> device_buffer_;
+
+  void IntraClientCopyToWithDependencies(
+      std::vector<tsl::RCReference<tsl::AsyncValue>> dependencies,
+      tsl::RCReference<CommonPjRtRawBuffer> dst_raw_buffer,
+      tsl::RCReference<PjRtDeviceEventPromise> definition_event_promise,
+      tsl::RCReference<PjRtDeviceEventPromise> src_usage_event_promise,
+      ::tsl::AsyncValueRef<bool> allocation_event);
 };
 
 }  // namespace xla

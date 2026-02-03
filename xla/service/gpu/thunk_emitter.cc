@@ -25,6 +25,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
@@ -68,23 +69,27 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/collective_metadata_thunk.h"
 #include "xla/backends/gpu/runtime/collective_permute_thunk.h"
 #include "xla/backends/gpu/runtime/collective_thunk.h"
-#include "xla/backends/gpu/runtime/command_buffer_cmd.h"
 #include "xla/backends/gpu/runtime/command_buffer_cmd_emitter.h"
 #include "xla/backends/gpu/runtime/command_buffer_thunk.h"
+#include "xla/backends/gpu/runtime/command_executor.h"
 #include "xla/backends/gpu/runtime/conditional_thunk.h"
 #include "xla/backends/gpu/runtime/convolution_filter_thunk.pb.h"
 #include "xla/backends/gpu/runtime/convolution_reorder_thunk.h"
 #include "xla/backends/gpu/runtime/convolution_thunk.h"
+#include "xla/backends/gpu/runtime/copy_done_thunk.h"
 #include "xla/backends/gpu/runtime/copy_thunk.h"
 #include "xla/backends/gpu/runtime/cub_sort_thunk.h"
 #include "xla/backends/gpu/runtime/cudnn_thunk.h"
 #include "xla/backends/gpu/runtime/custom_call_thunk.h"
 #include "xla/backends/gpu/runtime/custom_kernel_thunk.h"
+#include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
+#include "xla/backends/gpu/runtime/device_to_host_copy_thunk.h"
 #include "xla/backends/gpu/runtime/fft_thunk.h"
 #include "xla/backends/gpu/runtime/gemm_thunk.h"
 #include "xla/backends/gpu/runtime/gpublas_lt_matmul_thunk.h"
 #include "xla/backends/gpu/runtime/host_execute_thunk.h"
 #include "xla/backends/gpu/runtime/host_send_recv_thunk.h"
+#include "xla/backends/gpu/runtime/host_to_device_copy_thunk.h"
 #include "xla/backends/gpu/runtime/infeed_thunk.h"
 #include "xla/backends/gpu/runtime/kernel_thunk.h"
 #include "xla/backends/gpu/runtime/norm_thunk.h"
@@ -149,6 +154,7 @@ limitations under the License.
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_creation_utils.h"
 #include "xla/service/llvm_ir/buffer_assignment_util.h"
+#include "xla/service/llvm_ir/llvm_command_line_options.h"
 #include "xla/service/shaped_slice.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
@@ -372,14 +378,18 @@ static const HloInstruction* FindCanonicalSendRecvStartOp(
 
 }  // namespace
 
-ThunkEmitter::ThunkEmitter(IrEmitterContext* ir_emitter_context)
+ThunkEmitter::ThunkEmitter(
+    IrEmitterContext* absl_nonnull ir_emitter_context,
+    llvm_ir::LLVMCommandLineOptionsReleasableLock* absl_nonnull
+        llvm_options_lock)
     : ir_emitter_context_(ir_emitter_context),
       send_recv_events_(std::make_shared<HostSendRecvAsyncEvents>()),
       copy_events_(std::make_shared<CopyThunk::AsyncEvents>()),
       nvshmem_buffer_addresses_(std::make_shared<NvshmemBufferAddresses>()),
       call_graph_(CallGraph::Build(&ir_emitter_context->hlo_module())),
       constants_module_(ir_emitter_context_->CreateLLVMModule(
-          absl::StrCat(ir_emitter_context_->hlo_module().name(), "_consts"))) {}
+          absl::StrCat(ir_emitter_context_->hlo_module().name(), "_consts"))),
+      llvm_options_lock_(llvm_options_lock) {}
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConstant(
     const HloConstantInstruction* instr) {
@@ -483,21 +493,18 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCommandBufferThunk(
   // between all recorded commands. This guarantees that we execute
   // all device operations in the exact same order as a thunk
   // sequence.
-  CommandBufferCmdExecutor::SynchronizationMode synchronization_mode;
+  CommandExecutor::SynchronizationMode synchronization_mode;
   auto mode = ir_emitter_context_->debug_options()
                   .xla_gpu_command_buffer_scheduling_mode();
   switch (mode) {
     case DebugOptions::SERIALIZE:
-      synchronization_mode =
-          CommandBufferCmdExecutor::SynchronizationMode::kSerialize;
+      synchronization_mode = CommandExecutor::SynchronizationMode::kSerialize;
       break;
     case DebugOptions::CONCURRENT:
-      synchronization_mode =
-          CommandBufferCmdExecutor::SynchronizationMode::kConcurrent;
+      synchronization_mode = CommandExecutor::SynchronizationMode::kConcurrent;
       break;
     case DebugOptions::LHS:
-      synchronization_mode =
-          CommandBufferCmdExecutor::SynchronizationMode::kLHS;
+      synchronization_mode = CommandExecutor::SynchronizationMode::kLHS;
       break;
     default:
       return Internal("Unsupported command buffer scheduling mode: %d", mode);
@@ -506,7 +513,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCommandBufferThunk(
   bool enable_loop_unroll = ir_emitter_context_->debug_options()
                                 .xla_gpu_command_buffer_unroll_loops();
   TF_ASSIGN_OR_RETURN(
-      CommandBufferCmdExecutor cmd_executor,
+      CommandExecutor cmd_executor,
       ConvertToCommands(
           thunk_sequence,
           ConvertToCommandsOptions{synchronization_mode, enable_loop_unroll}));
@@ -905,7 +912,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCuDnnThunk(
       fingerprint,
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      kernel_arguments.GetArgumentBufferSlices(),
+      kernel_arguments.GetArgumentShapedSlices(),
       kernel_arguments.GetArgumentOutputFlags(), dropout_seed));
 }
 
@@ -938,24 +945,22 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCubDeviceRadixSort(
     return Internal("Invalid number of operands for radix sort");
   }
 
-  absl::InlinedVector<BufferAllocation::Slice, 2> operands;
+  absl::InlinedVector<ShapedSlice, 2> operands;
   for (int i = 0; i < instr->operand_count(); ++i) {
-    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice operand,
-                        GetAllocationSliceForHlo(instr->operand(i), {}));
+    TF_ASSIGN_OR_RETURN(ShapedSlice operand,
+                        GetShapedSliceForHlo(instr->operand(i), {}));
     operands.push_back(operand);
   }
 
-  absl::InlinedVector<BufferAllocation::Slice, 2> results;
-  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice result,
-                      GetAllocationSliceForHlo(instr, {0}));
+  absl::InlinedVector<ShapedSlice, 2> results;
+  TF_ASSIGN_OR_RETURN(ShapedSlice result, GetShapedSliceForHlo(instr, {0}));
   results.push_back(result);
 
   BufferAllocation::Slice scratch;
   if (instr->operand_count() == 1) {
     TF_ASSIGN_OR_RETURN(scratch, GetAllocationSliceForHlo(instr, {1}));
   } else {
-    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice result,
-                        GetAllocationSliceForHlo(instr, {1}));
+    TF_ASSIGN_OR_RETURN(ShapedSlice result, GetShapedSliceForHlo(instr, {1}));
     results.push_back(result);
     TF_ASSIGN_OR_RETURN(scratch, GetAllocationSliceForHlo(instr, {2}));
   }
@@ -968,10 +973,6 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCubDeviceRadixSort(
       CubSortThunk::Create(
           Thunk::ThunkInfo::WithProfileAnnotation(
               instr, ir_emitter_context_->GetNextThunkId()),
-          operand_shape.element_type(),
-          instr->operand_count() == 2
-              ? std::optional(instr->operand(1)->shape().element_type())
-              : std::nullopt,
           operands, results, scratch, options.descending(),
           Product(operand_shape.dimensions()) /
               operand_shape.dimensions(operand_shape.dimensions().size() - 1),
@@ -1054,13 +1055,15 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCustomCallThunk(
       }
       TF_ASSIGN_OR_RETURN(attributes, xla::ffi::BuildAttributesMap(dict));
     }
+    auto released_lock_keeper = llvm_options_lock_->TemporarilyReleaseLock();
     return CustomCallThunk::Create(
         Thunk::ThunkInfo::WithProfileAnnotation(
             instr, ir_emitter_context_->GetNextThunkId()),
         call_target_name, std::move(operands), std::move(results),
         std::move(attributes),
         called_computations.empty() ? nullptr : called_computations[0],
-        ir_emitter_context_->platform_name());
+        ir_emitter_context_->platform_name(),
+        ir_emitter_context_->gpu_compute_capability());
   };
 
   auto legacy_thunk =
@@ -1255,8 +1258,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTritonCustomCall(
     const HloCustomCallInstruction* instr) {
-  auto generate = [this, &instr]() -> absl::StatusOr<KernelReuseCache::Entry> {
-    mlir::MLIRContext& mlir_context = *ir_emitter_context_->mlir_context();
+  mlir::MLIRContext& mlir_context = *ir_emitter_context_->mlir_context();
+
+  auto generate = [this, &instr,
+                   &mlir_context]() -> absl::StatusOr<KernelReuseCache::Entry> {
     LoadMlirDialectsForTriton(mlir_context);
     auto call =
         TritonCall::Parse(instr->raw_backend_config_string(), &mlir_context);
@@ -1295,6 +1300,9 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTritonCustomCall(
     block_level_parameters.num_stages = call.num_stages;
     block_level_parameters.num_warps = call.num_warps;
     block_level_parameters.num_ctas = 1;
+    block_level_parameters.global_scratch_memory_size =
+        call.global_scratch_memory_size;
+    block_level_parameters.is_tma_allowed = call.is_tma_allowed;
 
     TF_ASSIGN_OR_RETURN(
         auto result,
@@ -1320,7 +1328,8 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTritonCustomCall(
       TF_ASSIGN_OR_RETURN(
           llvm::Function * kernel,
           RemoveUnusedTritonAbiArguments(result.llvm_module.get(),
-                                         *ir_emitter_context_, kernel_name));
+                                         *ir_emitter_context_, kernel_name,
+                                         call.global_scratch_memory_size > 0));
 
       AnnotateAttrsIfUnset(kernel_arguments, *kernel);
       TF_RETURN_IF_ERROR(AnnotateKernelLaunchDimensions(
@@ -1343,11 +1352,16 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTritonCustomCall(
                           ir_emitter_context_->buffer_assignment(),
                           GetDefaultBufferAlignment(), instr));
 
+  LoadMlirDialectsForTriton(mlir_context);
+  auto call =
+      TritonCall::Parse(instr->raw_backend_config_string(), &mlir_context);
+
   return GetThunkSequence(std::make_unique<KernelThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       entry->kernel_name, kernel_arguments, entry->launch_dimensions,
-      /*cluster_dim=*/std::nullopt, entry->shmem_bytes, entry->tma_metadata));
+      /*cluster_dim=*/std::nullopt, entry->shmem_bytes, entry->tma_metadata,
+      /*zeroed_output_buffer_indices=*/call.zeroed_outputs));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitAsyncComputation(

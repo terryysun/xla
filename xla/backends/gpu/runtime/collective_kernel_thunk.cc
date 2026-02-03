@@ -167,7 +167,8 @@ absl::Status CollectiveKernelThunk::Prepare(const PrepareParams& params) {
   if (!use_collective_kernel) {
     return absl::OkStatus();
   }
-  TF_RETURN_IF_ERROR(params.clique_requests->RequestClique(clique_key));
+  TF_RETURN_IF_ERROR(
+      params.collective_clique_requests->RequestClique(clique_key));
 
   absl::MutexLock lock(mutex_);
   if (!per_stream_memory_.contains(params.executor)) {
@@ -200,7 +201,7 @@ absl::Status CollectiveKernelThunk::Prepare(const PrepareParams& params) {
             std::move(local_buffers_handle), std::move(signal_buffers_handle),
             strategy, kLocalBufferSize, kSignalBufferSize}));
     if (is_multimem_enabled_ && strategy == AllReduceStrategy::kMultimem) {
-      params.multimem_registry->Register(
+      params.multimem_registry->Request(
           {clique_key, /*map_to=*/local_buffers_ptr});
     }
   }
