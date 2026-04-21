@@ -75,6 +75,7 @@ cc_library(
         "//xla/core/collectives:communicator",
         "//xla/core/collectives:rank_id",
         "//xla/service:lockable",
+        "//xla/service:rendezvous",
         "//xla/tsl/platform:logging",
         "//xla/tsl/util:tied_ref",
         "@com_google_absl//absl/base:core_headers",
@@ -313,10 +314,15 @@ xla_cc_test(
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/cuda:cuda_platform",
+        "//xla/stream_executor/integrations:device_mem_allocator",
         "//xla/tsl/concurrency:executor",
+        "//xla/tsl/framework:bfc_allocator",
         "//xla/tsl/platform:env",
+        "//xla/tsl/framework:device_id",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
@@ -545,7 +551,6 @@ cc_library(
         "//xla/runtime:device_id",
         "//xla/runtime:process_id",
         "//xla/stream_executor:stream_executor_h",
-        "//xla/stream_executor/cuda:nccl_allocator",  # buildcleaner: keep (static registration)
         "//xla/tsl/cuda:nccl",
         "//xla/tsl/platform:env",
         "//xla/tsl/platform:logging",
@@ -563,7 +568,6 @@ cc_library(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@tsl//tsl/platform:casts",
-        "@tsl//tsl/platform:numbers",
         "@tsl//tsl/profiler/lib:traceme",
     ],
     alwayslink = True,  # registers collectives implementation
@@ -618,7 +622,6 @@ cc_library(
         "@local_config_rocm//rocm:rccl",  # buildcleaner: keep
         "@local_config_rocm//rocm:rocm_headers",
         "@tsl//tsl/platform:casts",
-        "@tsl//tsl/platform:numbers",
     ],
     alwayslink = True,  # registers collectives implementation
 )
@@ -783,7 +786,6 @@ cc_library(
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:stream",
         "//xla/stream_executor/cuda:nvshmem",
-        "//xla/stream_executor/cuda:nvshmem_allocator",  # buildcleaner: keep (static registration)
         "//xla/tsl/concurrency:async_value",
         "//xla/tsl/platform:errors",
         "//xla/tsl/platform:statusor",

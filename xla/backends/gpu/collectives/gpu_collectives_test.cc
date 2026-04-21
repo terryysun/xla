@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/collectives/gpu_collectives.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -27,6 +28,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "xla/backends/gpu/collectives/cancellation_token.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
@@ -51,6 +53,9 @@ limitations under the License.
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/threadpool.h"
+#include "xla/stream_executor/integrations/device_mem_allocator.h"
+#include "xla/tsl/framework/bfc_allocator.h"
+#include "xla/tsl/framework/device_id.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla::gpu {
@@ -546,6 +551,105 @@ TEST(GpuCollectivesTest, PutAndWaitSignal) {
 
   EXPECT_THAT(h_recv0, testing::ElementsAre(5.0f, 6.0f, 7.0f, 8.0f));
   EXPECT_THAT(h_recv1, testing::ElementsAre(1.0f, 2.0f, 3.0f, 4.0f));
+}
+
+// Asymmetric init allocs on one GPU's BFC pool shift collective buffer offsets,
+// corrupting NCCL symmetric all-reduce.
+TEST(GpuCollectivesTest, BFCPoolAsSymmetricWindowCausesCorruption) {
+  ASSERT_OK_AND_ASSIGN(se::Platform * platform,
+                       se::PlatformManager::PlatformWithName("CUDA"));
+  if (platform->VisibleDeviceCount() < 2) {
+    GTEST_SKIP() << "Test requires at least 2 GPUs";
+  }
+  ASSERT_OK_AND_ASSIGN(auto executors, CreateExecutors(platform, 2));
+  if (!executors[0]->CanEnablePeerAccessTo(executors[1])) {
+    GTEST_SKIP() << "Test requires peer access between devices";
+  }
+
+  auto& comms = (new auto(CreateCommunicators(executors, {kD0, kD1})))->value();
+
+  constexpr size_t kCount = 1024 * 1024;  // 4MB
+  constexpr size_t kBytes = kCount * sizeof(float);
+  constexpr size_t kPoolSize = 64 * 1024 * 1024;
+  constexpr size_t kCollectiveAlign = 2 * 1024 * 1024;
+
+  // BFC + DeviceMemAllocator, allow_growth=false (gpu_helpers.cc:130,150).
+  tsl::BFCAllocator::Options opts;
+  opts.allow_growth = false;
+  auto make_bfc = [&](int d) {
+    return new tsl::BFCAllocator(
+        std::make_unique<se::DeviceMemAllocator>(
+            executors[d], tsl::PlatformDeviceId(d)),
+        kPoolSize, absl::StrCat("gpu", d), opts);
+  };
+
+  // GPU 0
+  auto* bfc0 = make_bfc(0);
+  (void)bfc0->AllocateRaw(256, 8); // PRNG seed on default device before SPMD executable.
+  void* c0 = bfc0->AllocateRaw(kCollectiveAlign, kBytes);
+  // GPU 1
+  auto* bfc1 = make_bfc(1);
+  void* c1 = bfc1->AllocateRaw(kCollectiveAlign, kBytes);
+  ASSERT_NE(c0, nullptr);
+  ASSERT_NE(c1, nullptr);
+
+  // cuMemGetAddressRange returns the sub-allocator region (collective_thunk.cc:240).
+  ASSERT_OK_AND_ASSIGN(auto r0, executors[0]->GetMemoryRange(
+      se::DeviceAddressBase(c0, kBytes)));
+  ASSERT_OK_AND_ASSIGN(auto r1, executors[1]->GetMemoryRange(
+      se::DeviceAddressBase(c1, kBytes)));
+  auto off0 = absl::bit_cast<uintptr_t>(c0) - absl::bit_cast<uintptr_t>(r0.opaque());
+  auto off1 = absl::bit_cast<uintptr_t>(c1) - absl::bit_cast<uintptr_t>(r1.opaque());
+  ASSERT_NE(off0, off1);
+
+  ASSERT_OK_AND_ASSIGN(auto s0, executors[0]->CreateStream());
+  ASSERT_OK_AND_ASSIGN(auto s1, executors[1]->CreateStream());
+  ASSERT_OK(s0->MemZero(&r0, r0.size()));
+  ASSERT_OK(s1->MemZero(&r1, r1.size()));
+  se::DeviceAddressBase b0(c0, kBytes), b1(c1, kBytes);
+  std::vector<float> ones(kCount, 1.0f), twos(kCount, 2.0f);
+  ASSERT_OK(s0->Memcpy(&b0, ones.data(), kBytes));
+  ASSERT_OK(s1->Memcpy(&b1, twos.data(), kBytes));
+  ASSERT_OK(s0->BlockHostUntilDone());
+  ASSERT_OK(s1->BlockHostUntilDone());
+
+  tsl::thread::ThreadPool tp(tsl::Env::Default(), "test", 2);
+  tsl::Executor& ex = *tp.AsExecutor();
+
+  // Registered symmetric window (collective_thunk.cc:248).
+  auto w0 = MakeFutureOn<void>(ex, [&]() -> absl::Status {
+    return comms[0]->RegisterBufferOnce(r0, 0, true);
+  });
+  auto w1 = MakeFutureOn<void>(ex, [&]() -> absl::Status {
+    return comms[1]->RegisterBufferOnce(r1, 1, true);
+  });
+  ASSERT_OK(w0.Await());
+  ASSERT_OK(w1.Await());
+
+  auto f0 = MakeFutureOn<void>(ex, [&]() -> absl::Status {
+    GpuCollectives::Executor ge(s0.get());
+    return comms[0]->AllReduce(b0, b0, F32, kCount, ReductionKind::SUM, ge).Await();
+  });
+  auto f1 = MakeFutureOn<void>(ex, [&]() -> absl::Status {
+    GpuCollectives::Executor ge(s1.get());
+    return comms[1]->AllReduce(b1, b1, F32, kCount, ReductionKind::SUM, ge).Await();
+  });
+  ASSERT_OK(f0.Await());
+  ASSERT_OK(f1.Await());
+
+  // SUM(1.0, 2.0) should be 3.0; offset mismatch corrupts it.
+  std::vector<float> h0(kCount), h1(kCount);
+  ASSERT_OK(s0->Memcpy(h0.data(), b0, kBytes));
+  ASSERT_OK(s1->Memcpy(h1.data(), b1, kBytes));
+  ASSERT_OK(s0->BlockHostUntilDone());
+  ASSERT_OK(s1->BlockHostUntilDone());
+
+  int wrong = 0;
+  for (size_t i = 0; i < kCount; ++i) {
+    if (h0[i] != 3.0f) wrong++;
+    if (h1[i] != 3.0f) wrong++;
+  }
+  EXPECT_GT(wrong, 0) << "Expected corruption from BFC offset mismatch";
 }
 
 }  // namespace
